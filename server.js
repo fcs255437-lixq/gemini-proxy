@@ -1,80 +1,68 @@
 const http = require('http');
-const https = require('https');
-const url = require('url');
+const net = require('net');
+const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 10000;
 
-// 目标映射路由表
-const ROUTE_TARGETS = {
-  '/antigravity': 'cloudcode-pa.googleapis.com',
-  '/gemini': 'generativelanguage.googleapis.com'
-};
-
 const server = http.createServer((req, res) => {
-  const parsedUrl = url.parse(req.url);
-  const pathname = parsedUrl.pathname || '';
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Render CPA WebSocket Gateway is active and running.\n');
+});
 
-  // 1. 健康检查路由
-  if (pathname === '/' || pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('CPA Native Reverse Proxy is running and healthy.\n');
-  }
+// 创建标准 WebSocket 服务器
+const wss = new WebSocketServer({ server });
 
-  // 2. 匹配路由前缀
-  let targetHost = null;
-  let targetPath = req.url;
+wss.on('connection', (ws, req) => {
+  let targetSocket = null;
 
-  for (const prefix in ROUTE_TARGETS) {
-    if (pathname.startsWith(prefix)) {
-      targetHost = ROUTE_TARGETS[prefix];
-      // 重写路径：去掉 /antigravity 或 /gemini 前缀
-      targetPath = req.url.slice(prefix.length) || '/';
-      break;
+  // 客户端第一帧发送目标地址: "host:port"，如 "daily-cloudcode-pa.googleapis.com:443"
+  ws.once('message', (message) => {
+    let target = message.toString().trim();
+    let [host, port] = target.split(':');
+    port = parseInt(port, 10) || 443;
+
+    if (!host) {
+      ws.close(1008, 'Invalid target');
+      return;
     }
-  }
 
-  // 未命中已知路由
-  if (!targetHost) {
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('404 Not Found: Unknown Gateway Route\n');
-  }
+    // 建立与目标的真实 TCP 连接
+    targetSocket = net.connect(port, host, () => {
+      // 确认连接成功，告知本地客户端
+      ws.send(Buffer.from([0x01])); // 0x01 表示 OK
 
-  // 3. 构建向上游 Google 的转发请求
-  const newHeaders = { ...req.headers };
-  newHeaders['host'] = targetHost;
-  // 避免 gzip/br 解码问题，保证纯净双向流式透传
-  delete newHeaders['content-length'];
+      // 之后收到的所有 WebSocket 二进制帧直接转发给目标
+      ws.on('message', (data) => {
+        if (targetSocket && !targetSocket.destroyed) {
+          targetSocket.write(data);
+        }
+      });
+    });
 
-  const options = {
-    hostname: targetHost,
-    port: 443,
-    path: targetPath,
-    method: req.method,
-    headers: newHeaders
-  };
+    // 目标发回的所有 TCP 数据直接打包成 WebSocket 帧发回客户端
+    targetSocket.on('data', (chunk) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(chunk);
+      }
+    });
 
-  const proxyReq = https.request(options, (proxyRes) => {
-    // 拷贝上游响应头
-    const resHeaders = { ...proxyRes.headers };
-    // 确保 CORS 开放
-    resHeaders['access-control-allow-origin'] = '*';
-    res.writeHead(proxyRes.statusCode, resHeaders);
-    // 双向流式透传（打字机 SSE 流式无缓冲直接吐回本地）
-    proxyRes.pipe(res);
+    targetSocket.on('error', (err) => {
+      console.error(`[TCP Error] -> ${host}:${port}:`, err.message);
+      ws.close(1011, err.message);
+    });
+
+    targetSocket.on('close', () => {
+      ws.close();
+    });
+
+    ws.on('close', () => {
+      if (targetSocket && !targetSocket.destroyed) {
+        targetSocket.destroy();
+      }
+    });
   });
-
-  proxyReq.on('error', (err) => {
-    console.error(`[Proxy Error] -> ${targetHost}:`, err.message);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Bad Gateway', detail: err.message }));
-    }
-  });
-
-  // 透传客户端的请求体到 Google
-  req.pipe(proxyReq);
 });
 
 server.listen(PORT, () => {
-  console.log(`[CPA Gateway] Zero-dependency reverse proxy listening on port ${PORT}`);
+  console.log(`[WSS Gateway] Server listening on port ${PORT}`);
 });
